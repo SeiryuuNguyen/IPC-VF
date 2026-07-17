@@ -1,0 +1,21 @@
+# Thư mục build và các file sinh ra
+build/
+build_*_*/
+sdkconfig
+sdkconfig.old
+
+# File cache Python
+__pycache__/
+.pytest_cache/
+pytest_embedded_log/
+
+# File log và báo cáo
+build_summary_*.xml
+app_info_*.txt
+size_info_*.txt
+dependencies.lock
+
+# File cấu hình editor (tuỳ chọn)
+.vscode/
+.idea/
+.DS_Store
