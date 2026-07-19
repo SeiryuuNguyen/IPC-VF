@@ -1,0 +1,5 @@
+dependencies:
+  espressif/spi_nand_flash:
+    version: '*'
+  espressif/spi_nand_flash_fatfs:
+    version: '*'
