@@ -1,0 +1,14 @@
+dependencies:
+  espressif/spi_nand_flash:
+    version: '*'
+  idf:
+    version: '>=5.0'
+description: FATFS integration for SPI NAND Flash
+documentation: https://github.com/espressif/idf-extra-components/tree/master/spi_nand_flash_fatfs/README.md
+issues: https://github.com/espressif/idf-extra-components/issues
+repository: git://github.com/espressif/idf-extra-components.git
+repository_info:
+  commit_sha: 70c1ba4a1b0a9fb1b280cd900da3a5a3dd6d3a7c
+  path: spi_nand_flash_fatfs
+url: https://github.com/espressif/idf-extra-components/tree/master/spi_nand_flash_fatfs
+version: 1.0.0
