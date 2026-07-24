@@ -16,3 +16,7 @@ dependencies:
   #   public: true
   espressif/spi_nand_flash: ^1.2.0
   espressif/spi_nand_flash_fatfs: "*"
+<<<<<<< HEAD
+=======
+  espressif/esp_tinyusb: ^2.0.1~1
+>>>>>>> feature/can-service

@@ -8,6 +8,11 @@
 #include "esp_system.h"
 #include "soc/spi_pins.h"
 
+<<<<<<< HEAD
+=======
+static const char* TAG = "NAND";
+
+>>>>>>> feature/can-service
 const char *base_path = "/nand";
 
 void init_nand_flash(spi_nand_flash_device_t **out_handle, spi_device_handle_t *spi_handle){
