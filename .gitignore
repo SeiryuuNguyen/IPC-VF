@@ -19,3 +19,4 @@ dependencies.lock
 .vscode/
 .idea/
 .DS_Store
+/managed_components
