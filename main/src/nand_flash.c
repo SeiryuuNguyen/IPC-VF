@@ -9,7 +9,6 @@
 #include "soc/spi_pins.h"
 
 static const char* TAG = "NAND";
-
 const char *base_path = "/nand";
 
 void init_nand_flash(spi_nand_flash_device_t **out_handle, spi_device_handle_t *spi_handle){

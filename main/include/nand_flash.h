@@ -5,6 +5,7 @@
 #include "spi_nand_flash.h"
 #include "esp_vfs_fat_nand.h"
 
+static const char *TAG = "NAND";
 extern const char *base_path;
 
 #define W25N02_MISO_PIN    GPIO_NUM_13
