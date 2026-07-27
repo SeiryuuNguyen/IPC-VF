@@ -13,5 +13,5 @@ idf_component_register(
         "include"
     # 3. Khai báo các component/thư viện khác mà thư mục main này phụ thuộc vào
     REQUIRES 
-        spi_nand_flash_fatfs
+        spi_nand_flash_fatfs app_update
 )

@@ -1,6 +1,7 @@
 #include "ht1621.h"
 #include "rom/ets_sys.h" // Dùng cho ets_delay_us()
 #include <string.h>
+#include <math.h>
 
 // Macro hỗ trợ
 #define WR_0(dev) gpio_set_level(dev->wr_pin, 0)
@@ -534,7 +535,7 @@ void ht1621_print_soc(ht1621_t *dev, uint16_t soc_percent) {
 
 // Hàm in số thực (đã bỏ debug)
 void ht1621_print_float_1_decimal(ht1621_t *dev, const digit_map_t *digits, uint8_t num_digits, float value, uint8_t dot_icon_id) {
-    uint32_t int_val = (uint32_t)(value * 10.0f);
+    uint32_t int_val = (uint32_t)roundf(value * 10.0f);
     for (uint8_t i = 0; i < num_digits; i++) {
         if (int_val == 0 && i >= 2) {
             ht1621_print_single_digit(dev, &digits[i], 0xFF);

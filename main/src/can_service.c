@@ -1,8 +1,25 @@
 #include "can_service.h"
 #include "esp_log.h"
 #include "esp_task_wdt.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "data_center.h"
 
 static const char *TAG = "CAN_SERVICE";
+
+static void can_process_task(void *arg){
+    twai_message_t rx_msg;
+    while (1) {
+        if (twai_receive(&rx_msg, portMAX_DELAY) == ESP_OK) {
+            if (xQueueSend(can_raw_queue_for_NAND, &rx_msg, pdMS_TO_TICKS(10)) != pdPASS) {
+                ESP_LOGW(TAG, "CanRawQueueForNAND bị đầy! Rơi bản tin.");
+            }
+            if(xQueueSend(can_raw_queue_for_display, &rx_msg, pdMS_TO_TICKS(10)) != pdPASS) {
+                ESP_LOGW(TAG, "CanRawQueueForDisplay bị đầy! Rơi bản tin.");
+            }
+        }
+    }
+}
 
 void can_init(void){
     twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX_IO, CAN_RX_IO, TWAI_MODE_NORMAL);
@@ -32,6 +49,6 @@ void can_init(void){
         ESP_LOGE(TAG, "twai_start lỗi: %s", esp_err_to_name(err));
         return;
     }
-
     ESP_LOGI(TAG, "TWAI đã RUNNING");
+    xTaskCreatePinnedToCore(can_process_task, "can_process_task", 4096, NULL, 5, NULL, 1);
 }

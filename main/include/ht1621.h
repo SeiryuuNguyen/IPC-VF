@@ -66,8 +66,7 @@ typedef enum {
     ICON_BATTERY_40,
     ICON_BATTERY_30,
     ICON_BATTERY_20,
-    ICON_BATTERY_10,
-    ICON_MAX
+    ICON_BATTERY_10
 } ht1621_icon_t;
 
 typedef struct {
