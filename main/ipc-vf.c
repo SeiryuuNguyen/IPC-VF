@@ -11,6 +11,7 @@
 #include "freertos/queue.h"
 #include "sdkconfig.h"
 #include "driver/ledc.h"
+#include "audio_service.h"
 
 // Các thư viện của dự án
 #include "usb-cdc.h"
@@ -40,24 +41,6 @@ typedef struct {
     uint8_t buf[CONFIG_TINYUSB_CDC_RX_BUFSIZE + 1];
 } app_message_t;
 
-uint64_t count = 0;
-// Hàm giả định: Trích xuất thời gian (System Time) từ gói tin CAN
-// Bạn cần thay thế logic này bằng ID CAN thực tế chứa RTC của xe
-uint32_t extract_system_time_from_can() {
-    // if (msg->identifier == 0x3F9) { // Giả sử ID 0x3F9 chứa thời gian
-    //     return (msg->data[0] << 24) | (msg->data[1] << 16) | (msg->data[2] << 8) | msg->data[3];
-    // }
-    return count; 
-}
-
-void count_task(void *pvParameters){
-    while(1){
-        count++;
-        extract_system_time_from_can();
-        vTaskDelay(pdMS_TO_TICKS(500));
-    }
-}
-
 /* =====================================================================
  * CALLBACK USB CDC: Phân luồng Lệnh và OTA Firmware
  * ===================================================================== */
@@ -68,7 +51,6 @@ void usb_cdc_rx_handler(int itf, cdcacm_event_t *event) {
     
     if (ret == ESP_OK && rx_size > 0) {
         if (ota_in_progress) {
-            // Đang Update Firmware -> Ghi thẳng vào phân vùng OTA
             esp_ota_write(update_handle, rx_buf, rx_size);
             ota_bytes_written += rx_size;
             
@@ -81,10 +63,9 @@ void usb_cdc_rx_handler(int itf, cdcacm_event_t *event) {
                 usb_cdc_send_data(itf, (uint8_t*)msg, strlen(msg));
                 
                 vTaskDelay(pdMS_TO_TICKS(1000));
-                esp_restart(); // Reset mạch để chạy Firmware mới
+                esp_restart(); 
             }
         } else {
-            // Chế độ bình thường -> Gửi lệnh vào Queue
             app_message_t tx_msg = { .buf_len = rx_size, .itf = itf };
             memcpy(tx_msg.buf, rx_buf, rx_size);
             xQueueSendFromISR(app_queue, &tx_msg, NULL); 
@@ -101,15 +82,22 @@ void usb_cdc_task(void *pvParameters) {
         if (xQueueReceive(app_queue, &msg, portMAX_DELAY)) {
             msg.buf[msg.buf_len] = '\0'; 
             
-            // Lệnh 1: LIST - Liệt kê file
             if (strncmp((char *)msg.buf, "LIST", 4) == 0) {
                 DIR *dir = opendir("/nand");
                 if (dir) {
                     struct dirent *ent;
-                    // Tăng từ 256 lên 300 để tránh cảnh báo Format Truncation
-                    char list_buf[300]; 
+                    char list_buf[300];
                     while ((ent = readdir(dir)) != NULL) {
-                        snprintf(list_buf, sizeof(list_buf), "FILE: %s\r\n", ent->d_name);
+                        char filepath[300]; 
+                        snprintf(filepath, sizeof(filepath), "/nand/%s", ent->d_name);
+                        
+                        struct stat st;
+                        uint32_t fsize = 0;
+                        if (stat(filepath, &st) == 0) {
+                            fsize = st.st_size;
+                        }
+                        
+                        snprintf(list_buf, sizeof(list_buf), "FILE: %s (Size: %lu bytes)\r\n", ent->d_name, (unsigned long)fsize);
                         usb_cdc_send_data(msg.itf, (uint8_t *)list_buf, strlen(list_buf));
                     }
                     closedir(dir);
@@ -117,8 +105,6 @@ void usb_cdc_task(void *pvParameters) {
                 char *end = "---END_LIST---\r\n";
                 usb_cdc_send_data(msg.itf, (uint8_t *)end, strlen(end));
             }
-            
-            // Lệnh 2: GET <filename> - Gửi file cho PC
             else if (strncmp((char *)msg.buf, "GET ", 4) == 0) {
                 char filename[64];
                 sscanf((char *)msg.buf, "GET %s", filename);
@@ -128,35 +114,33 @@ void usb_cdc_task(void *pvParameters) {
                 
                 struct stat st;
                 if (stat(filepath, &st) == 0) {
-                    // Gửi kích thước file trước
                     char size_msg[64];
                     snprintf(size_msg, sizeof(size_msg), "SIZE:%ld\r\n", st.st_size);
                     usb_cdc_send_data(msg.itf, (uint8_t *)size_msg, strlen(size_msg));
                     
-                    // Gửi dữ liệu nhị phân
                     FILE *f = fopen(filepath, "rb");
-                    uint8_t file_buf[512];
-                    size_t read_bytes;
-                    while ((read_bytes = fread(file_buf, 1, sizeof(file_buf), f)) > 0) {
-                        usb_cdc_send_data(msg.itf, file_buf, read_bytes);
-                        vTaskDelay(pdMS_TO_TICKS(1)); 
+                    if (f) {
+                        uint8_t file_buf[1024];
+                        size_t read_bytes;
+                        while ((read_bytes = fread(file_buf, 1, sizeof(file_buf), f)) > 0) {
+                            usb_cdc_send_data(msg.itf, file_buf, read_bytes);
+                            vTaskDelay(pdMS_TO_TICKS(1)); 
+                        }
+                        fclose(f);
                     }
-                    fclose(f);
                 } else {
                     char *err = "ERROR: File not found\r\n";
                     usb_cdc_send_data(msg.itf, (uint8_t *)err, strlen(err));
                 }
             }
-            
-            // Lệnh 3: UPDATE <size> - Chuẩn bị nhận OTA Firmware
             else if (strncmp((char *)msg.buf, "UPDATE ", 7) == 0) {
-                sscanf((char *)msg.buf, "UPDATE %d", &ota_total_size);
+                sscanf((char *)msg.buf, "UPDATE %lu", (unsigned long*)&ota_total_size);
                 update_partition = esp_ota_get_next_update_partition(NULL);
                 if (update_partition != NULL && ota_total_size > 0) {
                     esp_err_t err = esp_ota_begin(update_partition, OTA_WITH_SEQUENTIAL_WRITES, &update_handle);
                     if (err == ESP_OK) {
                         ota_bytes_written = 0;
-                        ota_in_progress = true; // Block các lệnh khác, bắt đầu nhận nhị phân
+                        ota_in_progress = true; 
                         char *ready = "READY\r\n";
                         usb_cdc_send_data(msg.itf, (uint8_t *)ready, strlen(ready));
                     }
@@ -167,31 +151,28 @@ void usb_cdc_task(void *pvParameters) {
 }
 
 /* =====================================================================
- * TASK LƯU TRỮ (NAND LOGGER): Buffer 32KB, Timeout 3s & Xoay vòng file
+ * TASK LƯU TRỮ (NAND LOGGER): Ghi liên tục, nối file 10MB
  * ===================================================================== */
-#define BUFFER_SIZE (32 * 1024) 
-#define MAX_FILE_SIZE (10 * 1024 * 1024) // 10MB
-#define MAX_FILES_COUNT 25 // Giới hạn tổng dung lượng ~250MB để tránh đầy NAND
+#define MAX_FILE_SIZE (10 * 1024 * 1024) 
+#define MAX_FILES_COUNT 24
+#define FSYNC_INTERVAL_BYTES (256 * 1024) 
 
-// Hàm hỗ trợ: Xóa file cũ nhất khi đầy thẻ
 void rotate_oldest_log() {
     DIR *dir = opendir("/nand");
     if (!dir) return;
 
     struct dirent *ent;
-    // Tăng kích thước mảng lên 300
-    char oldest_file[300] = ""; 
-    uint32_t oldest_time = 0xFFFFFFFF;
+    char oldest_file[300] = "";
+    uint32_t oldest_idx = 0xFFFFFFFF;
     int file_count = 0;
 
     while ((ent = readdir(dir)) != NULL) {
-        if (strstr(ent->d_name, "log_") != NULL) {
+        if (strstr(ent->d_name, "can_") != NULL) {
             file_count++;
-            // Sửa thành unsigned int để khớp với định dạng %u của sscanf
-            unsigned int file_time; 
-            if (sscanf(ent->d_name, "log_%u.bin", &file_time) == 1) {
-                if (file_time < oldest_time) {
-                    oldest_time = file_time;
+            uint32_t idx;
+            if (sscanf(ent->d_name, "can_%lu.bin", (unsigned long*)&idx) == 1) {
+                if (idx < oldest_idx) {
+                    oldest_idx = idx;
                     snprintf(oldest_file, sizeof(oldest_file), "/nand/%s", ent->d_name);
                 }
             }
@@ -199,88 +180,120 @@ void rotate_oldest_log() {
     }
     closedir(dir);
 
-    // Nếu số file vượt quá giới hạn, tiến hành xóa file
     if (file_count > MAX_FILES_COUNT && strlen(oldest_file) > 0) {
         unlink(oldest_file);
-        ESP_LOGI(TAG, "Đã xóa file cũ để giải phóng dung lượng: %s", oldest_file);
+        ESP_LOGI(TAG, "Đã xóa file cũ giải phóng dung lượng: %s", oldest_file);
+    }
+}
+
+void get_active_log_file(char* filename, uint32_t* current_size) {
+    DIR *dir = opendir("/nand");
+    if (!dir) {
+        strcpy(filename, "/nand/can_1.bin");
+        *current_size = 0;
+        return;
+    }
+
+    struct dirent *ent;
+    uint32_t max_idx = 0;
+    char temp_name[128];
+
+    while ((ent = readdir(dir)) != NULL) {
+        uint32_t idx;
+        if (sscanf(ent->d_name, "can_%lu.bin", (unsigned long*)&idx) == 1) {
+            if (idx > max_idx) max_idx = idx;
+        }
+    }
+    closedir(dir);
+
+    if (max_idx == 0) {
+        strcpy(filename, "/nand/can_1.bin");
+        *current_size = 0;
+        return;
+    }
+
+    snprintf(temp_name, sizeof(temp_name), "/nand/can_%lu.bin", (unsigned long)max_idx);
+    struct stat st;
+    if (stat(temp_name, &st) == 0) {
+        if (st.st_size < MAX_FILE_SIZE) {
+            strcpy(filename, temp_name);
+            *current_size = st.st_size;
+        } else {
+            snprintf(filename, 64, "/nand/can_%lu.bin", (unsigned long)(max_idx + 1));
+            *current_size = 0;
+        }
+    } else {
+        strcpy(filename, temp_name);
+        *current_size = 0;
     }
 }
 
 void nand_logger_task(void *arg) {
-    twai_message_t can_msg;
-    FILE *f = NULL;
     char current_filename[64] = "";
     uint32_t current_file_size = 0;
+    uint8_t write_chunk[4096]; 
     
-    // Cấp phát Buffer 32KB vào bộ nhớ PSRAM ngoài
-    uint8_t *ram_buffer = (uint8_t *)malloc(BUFFER_SIZE);
-    if (!ram_buffer) {
-        ESP_LOGE(TAG, "Lỗi: Không đủ RAM để cấp phát 128KB! Hãy kiểm tra lại cấu hình PSRAM.");
-        vTaskDelete(NULL);
+    // Biến theo dõi dung lượng để fsync định kỳ
+    size_t bytes_since_last_sync = 0; 
+    
+    get_active_log_file(current_filename, &current_file_size);
+    FILE *f = fopen(current_filename, "ab"); 
+
+    if (f) {
+        ESP_LOGI(TAG, "Bắt đầu ghi vào: %s (Size: %lu bytes)", current_filename, (unsigned long)current_file_size);
     }
-    size_t buffer_idx = 0;
 
     while(1) {
-        // Đợi dữ liệu CAN với Timeout 3 giây (3000 ticks)
-        if (xQueueReceive(can_raw_queue_for_NAND, &can_msg, pdMS_TO_TICKS(3000)) == pdTRUE) {
-            
-            // Nếu chưa có file nào đang mở, cần tạo file mới
-            if (strlen(current_filename) == 0) {
-                uint32_t sys_time = extract_system_time_from_can();
-                if (sys_time != 0) {
-                    // Chuyển %u thành %lu và ép kiểu sys_time sang unsigned long
-                    snprintf(current_filename, sizeof(current_filename), "/nand/log_%lu.bin", (unsigned long)sys_time);
-                    rotate_oldest_log(); // Kiểm tra dọn dẹp trước khi tạo
-                    current_file_size = 0;
-                }
-            }
-
-            // Ghi dữ liệu gói CAN vào Buffer RAM
-            if (buffer_idx + sizeof(twai_message_t) <= BUFFER_SIZE) {
-                memcpy(&ram_buffer[buffer_idx], &can_msg, sizeof(twai_message_t));
-                buffer_idx += sizeof(twai_message_t);
-            }
-
-            // KHI BUFFER ĐẦY 128KB -> GHI XUỐNG NAND
-            if (buffer_idx >= BUFFER_SIZE && strlen(current_filename) > 0) {
-                f = fopen(current_filename, "ab"); // Mở file ở chế độ nối tiếp
-                if (f) {
-                    fwrite(ram_buffer, 1, buffer_idx, f);
-                    fclose(f);
-                    current_file_size += buffer_idx;
-                }
-                buffer_idx = 0; // Xóa đệm
-                
-                // Nếu file đã đạt giới hạn 10MB, xóa tên để lần sau tạo file mới
-                if (current_file_size >= MAX_FILE_SIZE) {
-                    current_filename[0] = '\0';
-                }
-            }
-            
-        } else {
-            // TIMEOUT 3 GIÂY (Không nhận được dữ liệu mạng CAN)
-            if (buffer_idx > 0 && strlen(current_filename) > 0) {
-                ESP_LOGI(TAG, "Mạng CAN tĩnh lặng 3s. Tiến hành ghi %d bytes tồn đọng xuống NAND.", buffer_idx);
+        size_t received_bytes = xStreamBufferReceive(can_nand_stream, write_chunk, sizeof(write_chunk), pdMS_TO_TICKS(3000));
+        
+        if (received_bytes > 0) {
+            if (f == NULL) {
+                rotate_oldest_log(); 
                 f = fopen(current_filename, "ab");
-                if (f) {
-                    fwrite(ram_buffer, 1, buffer_idx, f);
-                    fclose(f); // Đóng file ngay lập tức theo yêu cầu
-                    current_file_size += buffer_idx;
-                }
-                buffer_idx = 0;
+            }
+
+            if (f) {
+                size_t written_bytes = fwrite(write_chunk, 1, received_bytes, f);
                 
-                // Kiểm tra giới hạn 10MB
-                if (current_file_size >= MAX_FILE_SIZE) {
-                    current_filename[0] = '\0';
+                current_file_size += written_bytes;
+                bytes_since_last_sync += written_bytes;
+
+                // CHỈ FSYNC KHI ĐỦ 256KB (Giảm tải 99% cho NAND)
+                if (bytes_since_last_sync >= FSYNC_INTERVAL_BYTES) {
+                    fflush(f);
+                    fsync(fileno(f)); 
+                    bytes_since_last_sync = 0;
+                    // In log để bạn biết file đang lớn lên
+                    // ESP_LOGI(TAG, "Đã đồng bộ mốc %lu bytes", (unsigned long)current_file_size);
                 }
+
+                if (current_file_size >= MAX_FILE_SIZE || written_bytes < received_bytes) {
+                    // Đóng file an toàn
+                    fflush(f);
+                    fsync(fileno(f));
+                    fclose(f);
+                    f = NULL;
+                    bytes_since_last_sync = 0;
+                    
+                    uint32_t next_idx = 1;
+                    sscanf(current_filename, "/nand/can_%lu.bin", (unsigned long*)&next_idx);
+                    next_idx++;
+                    snprintf(current_filename, sizeof(current_filename), "/nand/can_%lu.bin", (unsigned long)next_idx);
+                    current_file_size = 0;
+                    ESP_LOGI(TAG, "Tạo file 10MB mới: %s", current_filename);
+                }
+            }
+        } else {
+            // Khi tắt máy xe (Mạng CAN tĩnh lặng), vét sạch dữ liệu và đồng bộ hiển thị
+            if (f) {
+                fflush(f);
+                fsync(fileno(f));
+                bytes_since_last_sync = 0;
             }
         }
     }
 }
 
-/* =====================================================================
- * Hàm khởi tạo icon màn hình
- * ===================================================================== */
 void icon_init(void){
     ht1621_set_icon(&lcd_dev, ICON_TRIP, 1);
     ht1621_set_icon(&lcd_dev, ICON_KM_TRIP, 1);
@@ -303,64 +316,76 @@ void icon_init(void){
  * TASK HIỂN THỊ (DISPLAY)
  * ===================================================================== */
 void display_task(void *arg) {
-    twai_message_t can_msg;
-    uint16_t vehicle_speed = 0;
-    uint16_t vehicle_soc = 0;
-    uint8_t vehicle_gear= 0;
-    bool vehicle_turn_left = 0;
-    bool vehicle_turn_right = 0;
-    bool vehicle_beam_low = 0;
-    bool vehicle_beam_high = 0;
-
     while(1) {
-        if (xQueueReceive(can_raw_queue_for_display, &can_msg, pdMS_TO_TICKS(50)) == pdTRUE) {
-            if (can_msg.identifier == 0x1A6) vehicle_speed = can_msg.data[0];
-            if (can_msg.identifier == 0x2B4) vehicle_soc = can_msg.data[0];
-            switch(can_msg.identifier){
-                case 0x40D:
-                    vehicle_speed = can_msg.data[2] << 1 | ((can_msg.data[3] >> 7) & 0x01);
-                break;
-                case 0x162:
-                    vehicle_gear = (can_msg.data[2] >> 2) & 0x07;
-                break;
-                case 0x106:
-                    vehicle_turn_left = can_msg.data[2] & 0x01;
-                    vehicle_turn_right = (can_msg.data[2] >> 1) & 0x01;
-                    vehicle_beam_high = (can_msg.data[2] >> 6) & 0x01;
-                    vehicle_beam_low = (can_msg.data[2] >> 4) & 0x01;
-                break;
-                case 0x37D:
-                    vehicle_soc = (uint16_t)(((can_msg.data[2] << 2) | ((can_msg.data[3] >> 6) & 0x03)) * 0.1);
-                break;
-            }
-        }
-        ht1621_clear(&lcd_dev);
+        // ht1621_clear(&lcd_dev);
         icon_init();
+        
+        // ----------------- VẼ ĐÈN BÁO TRẠNG THÁI (ICON) -----------------
+        ht1621_set_icon(&lcd_dev, ICON_LEFT_TURN_SIGNAL, icon_turn_left);
+        ht1621_set_icon(&lcd_dev, ICON_POSITION_LIGHT, icon_position_light);
+        ht1621_set_icon(&lcd_dev, ICON_LOW_BEAM, icon_low_beam);
+        ht1621_set_icon(&lcd_dev, ICON_HIGH_BEAM, icon_high_beam);
+        ht1621_set_icon(&lcd_dev, ICON_FOG_LIGHT, icon_fog_light);
+        ht1621_set_icon(&lcd_dev, ICON_PARKING_BRAKE_STATUS, icon_parking_brake);
+        ht1621_set_icon(&lcd_dev, ICON_SEAT_BELT_WARNING, icon_seat_belt);
+        ht1621_set_icon(&lcd_dev, ICON_DOOR_AJAR_WARNING, icon_door_open);
+        ht1621_set_icon(&lcd_dev, ICON_AIRBAG_WARNING, icon_airbag_fault);
+        ht1621_set_icon(&lcd_dev, ICON_12V_BATTERY_FAULT, icon_low_battery);
+        ht1621_set_icon(&lcd_dev, ICON_RIGHT_TURN_SIGNAL, icon_turn_right);
+        ht1621_set_icon(&lcd_dev, ICON_BRAKE_WARNING, icon_brake_sys_fault);
+        ht1621_set_icon(&lcd_dev, ICON_BMS_BATTERY_TEMP_ERROR, icon_bms_temp_fault);
+        ht1621_set_icon(&lcd_dev, ICON_HIGHT_VOLTAGE_FAULT, icon_high_voltage_fault);
+        ht1621_set_icon(&lcd_dev, ICON_POWERTRAIN_FAULT, icon_powertrain_fault);
+        ht1621_set_icon(&lcd_dev, ICON_TCS_WARNING, icon_tcs_fault);
+        ht1621_set_icon(&lcd_dev, ICON_ABS_WARNING, icon_abs_fault);
+        ht1621_set_icon(&lcd_dev, ICON_POWER_LIMITED_FAULT, icon_power_limit);
+        ht1621_set_icon(&lcd_dev, ICON_EPS_WARNING, icon_eps_fault);
+        ht1621_set_icon(&lcd_dev, ICON_CHARGING_STATUS, icon_charging);
+        ht1621_set_icon(&lcd_dev, ICON_FULLY_CHARGED, icon_charge_full);
+        ht1621_set_icon(&lcd_dev, ICON_CHARGER_NOT_DETECTED, icon_gun_not_confirmed);
+        
+        // Trạng thái số xe (0=N, 1=R, 2=D)
+        ht1621_set_icon(&lcd_dev, ICON_N_POSITION, (vehicle_gear == 0));
+        ht1621_set_icon(&lcd_dev, ICON_R_POSITION, (vehicle_gear == 1));
+        ht1621_set_icon(&lcd_dev, ICON_D_POSITION, (vehicle_gear == 2));
+        ht1621_set_icon(&lcd_dev, ICON_READRY, vehicle_ready);
+
+        // ----------------- VẠCH PIN TUYẾN TÍNH -----------------
+        ht1621_set_icon(&lcd_dev, ICON_BATTERY_10,  (vehicle_soc >= 10));
+        ht1621_set_icon(&lcd_dev, ICON_BATTERY_20,  (vehicle_soc >= 20));
+        ht1621_set_icon(&lcd_dev, ICON_BATTERY_30,  (vehicle_soc >= 30));
+        ht1621_set_icon(&lcd_dev, ICON_BATTERY_40,  (vehicle_soc >= 40));
+        ht1621_set_icon(&lcd_dev, ICON_BATTERY_50,  (vehicle_soc >= 50));
+        ht1621_set_icon(&lcd_dev, ICON_BATTERY_60,  (vehicle_soc >= 60));
+        ht1621_set_icon(&lcd_dev, ICON_BATTERY_70,  (vehicle_soc >= 70));
+        ht1621_set_icon(&lcd_dev, ICON_BATTERY_80,  (vehicle_soc >= 80));
+        ht1621_set_icon(&lcd_dev, ICON_BATTERY_90,  (vehicle_soc >= 90));
+        ht1621_set_icon(&lcd_dev, ICON_BATTERY_1OO, (vehicle_soc >= 100)); // Lưu ý: Tên biến kết thúc bằng chữ 'O' theo khai báo cũ của bạn
+
+        // Các Icon chữ đi kèm buộc phải hiển thị tĩnh
+        ht1621_set_icon(&lcd_dev, ICON_KM_H_SPEED, 1);
+        ht1621_set_icon(&lcd_dev, ICON_PERCENT_SOC, 1);
+        ht1621_set_icon(&lcd_dev, ICON_KM_RANGE, 1);
+        ht1621_set_icon(&lcd_dev, ICON_KM_ODO, 1);
+        ht1621_set_icon(&lcd_dev, ICON_KM_TRIP, 1);
+        ht1621_set_icon(&lcd_dev, ICON_BATTERY, 1);
+
+        // ----------------- VẼ THÔNG SỐ VẬN HÀNH (DATA) -----------------
         ht1621_print_speed(&lcd_dev, vehicle_speed);
         ht1621_print_soc(&lcd_dev, vehicle_soc);
-        if(vehicle_gear == 2){
-            ht1621_set_icon(&lcd_dev, ICON_R_POSITION, 1);
-            ht1621_set_icon(&lcd_dev, ICON_N_POSITION, 0);
-            ht1621_set_icon(&lcd_dev, ICON_D_POSITION, 0);
-        } else if(vehicle_gear == 3){
-            ht1621_set_icon(&lcd_dev, ICON_R_POSITION, 0);
-            ht1621_set_icon(&lcd_dev, ICON_N_POSITION, 1);
-            ht1621_set_icon(&lcd_dev, ICON_D_POSITION, 0);
-        } else if(vehicle_gear == 4){
-            ht1621_set_icon(&lcd_dev, ICON_R_POSITION, 0);
-            ht1621_set_icon(&lcd_dev, ICON_N_POSITION, 0);
-            ht1621_set_icon(&lcd_dev, ICON_D_POSITION, 1);
-        }
-        ht1621_set_icon(&lcd_dev, ICON_LEFT_TURN_SIGNAL, vehicle_turn_left);
-        ht1621_set_icon(&lcd_dev, ICON_RIGHT_TURN_SIGNAL, vehicle_turn_right);
-        ht1621_set_icon(&lcd_dev, ICON_HIGH_BEAM, vehicle_beam_high);
-        ht1621_set_icon(&lcd_dev, ICON_LOW_BEAM, vehicle_beam_low);
+        ht1621_print_range(&lcd_dev, vehicle_range);
+        ht1621_print_odo(&lcd_dev, vehicle_odo);
+        ht1621_print_trip(&lcd_dev, vehicle_trip);
+        ht1621_print_average_speed(&lcd_dev, vehicle_avg_speed);
+        ht1621_print_average_power(&lcd_dev, vehicle_avg_power);
+
         ht1621_update(&lcd_dev);
-        vTaskDelay(pdMS_TO_TICKS(500));
+        
+        // Làm mới màn hình ở tốc độ khoảng ~20 FPS
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 
-//Ham khoi tao backlight
 void backlight_init(void){
     ledc_timer_config_t ledc_timer = {
         .speed_mode       = LEDC_LOW_SPEED_MODE,
@@ -384,13 +409,15 @@ void backlight_init(void){
     ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0));
 }
 
+
 /* =====================================================================
  * HÀM MAIN
  * ===================================================================== */
 void app_main(void) {
-    app_queue = xQueueCreate(10, sizeof(app_message_t));
     backlight_init();
+    app_queue = xQueueCreate(10, sizeof(app_message_t));
     data_center_init();
+    audio_service_start();
 
     init_nand_flash(&nand, &spi);
 
@@ -409,7 +436,15 @@ void app_main(void) {
     can_init();
 
     xTaskCreatePinnedToCore(display_task,     "display_task", 4096, NULL, 4, NULL, 1);
-    xTaskCreatePinnedToCore(nand_logger_task, "nand_task",    8192, NULL, 3, NULL, 0); // Tăng Stack vì có xử lý File System
-    xTaskCreatePinnedToCore(usb_cdc_task,     "usb_task",     4096, NULL, 2, NULL, 0);
-    xTaskCreatePinnedToCore(count_task, "count_task", 2048, NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(nand_logger_task, "nand_task",    8192, NULL, 3, NULL, 0); 
+    xTaskCreatePinnedToCore(usb_cdc_task,     "usb_task",     8192, NULL, 2, NULL, 0);
+
+    while(1){
+        // audio_play(AUDIO_EFFECT_TURN_SIGNAL);
+        // vTaskDelay(pdMS_TO_TICKS(10000));
+        // audio_play(AUDIO_EFFECT_LOW_BATTERY);
+        // vTaskDelay(pdMS_TO_TICKS(10000));
+        // audio_play(AUDIO_EFFECT_SYSTEM_FAULT);
+        vTaskDelay(pdMS_TO_TICKS(10000));
+    }
 }
